@@ -17,6 +17,26 @@ except ImportError:
     _flash_attn_forward = None
     flash_attn_func = None
 
+try:
+    from sageattention import (
+        sageattn,
+        sageattn_qk_int8_pv_fp16_triton,
+        sageattn_qk_int8_pv_fp16_cuda,
+        sageattn_qk_int8_pv_fp8_cuda,
+        sageattn_qk_int8_pv_fp8_cuda_sm90,
+        sageattn_varlen
+    )
+    has_sageattn = True
+except ImportError:
+    has_sageattn = False
+    sageattn = None
+    sageattn_qk_int8_pv_fp16_triton = None
+    sageattn_qk_int8_pv_fp16_cuda = None
+    sageattn_qk_int8_pv_fp8_cuda = None
+    sageattn_qk_int8_pv_fp8_cuda_sm90 = None
+    sageattn_varlen = None
+
+
 MEMORY_LAYOUT = {
     # flash模式:
     # 预处理: 输入 [batch_size, seq_len, num_heads, head_dim]
@@ -36,7 +56,49 @@ MEMORY_LAYOUT = {
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
     ),
+    "sage": (
+        lambda x: x.transpose(1, 2),  # (B,S,A,D) -> (B,A,S,D)
+        lambda x: x.transpose(1, 2),  # (B,A,S,D) -> (B,S,A,D)
+    ),
+    "sage-nhd": (
+        lambda x: x,
+        lambda x: x,
+    ),
 }
+
+
+def get_optimal_sage_kernel(device_type, dtype):
+    """
+    Select the optimal SageAttention kernel based on GPU type and data type
+    
+    Args:
+        device_type (str): GPU architecture (e.g., 'cuda:0')
+        dtype (torch.dtype): Data type (e.g., torch.float16, torch.bfloat16)
+    
+    Returns:
+        function: Optimal SageAttention function for the hardware
+    """
+    # Default to auto-selection
+    if not has_sageattn:
+        raise ImportError("SageAttention is not installed. Please install it first.")
+    
+    device_prop = torch.cuda.get_device_properties(device_type)
+    compute_capability = device_prop.major * 10 + device_prop.minor
+    
+    if compute_capability >= 90:
+        return sageattn_qk_int8_pv_fp8_cuda_sm90
+    
+    elif compute_capability >= 89:
+        if torch.cuda.get_device_capability(device_type)[0] >= 12 and torch.cuda.get_device_capability(device_type)[1] >= 4:
+            return sageattn_qk_int8_pv_fp8_cuda
+        else:
+            return sageattn_qk_int8_pv_fp16_cuda
+    
+    elif compute_capability >= 80:
+        return sageattn_qk_int8_pv_fp16_cuda
+    
+    else:
+        return sageattn_qk_int8_pv_fp16_triton
 
 
 def attention(
@@ -47,6 +109,7 @@ def attention(
     drop_rate=0,
     attn_mask=None,
     causal=False,
+    sage_tensor_layout="HND",
 ):
     """
     执行QKV自注意力计算
@@ -55,24 +118,56 @@ def attention(
         q (torch.Tensor): 查询张量，形状 [batch_size, seq_len, num_heads, head_dim]
         k (torch.Tensor): 键张量，形状 [batch_size, seq_len_kv, num_heads, head_dim]
         v (torch.Tensor): 值张量，形状 [batch_size, seq_len_kv, num_heads, head_dim]
-        mode (str): 注意力模式，可选 'flash', 'torch', 'vanilla'
+        mode (str): 注意力模式，可选 'flash', 'torch', 'vanilla', 'sage', 'sage-nhd'
         drop_rate (float): 注意力矩阵的dropout概率
         attn_mask (torch.Tensor): 注意力掩码，形状根据模式不同而变化
         causal (bool): 是否使用因果注意力（仅关注前面位置）
+        sage_tensor_layout (str): SageAttention的张量布局，可选 'HND' 或 'NHD'
 
     Returns:
         torch.Tensor: 注意力输出，形状 [batch_size, seq_len, num_heads * head_dim]
     """
-    # 获取预处理和后处理函数
+    if mode in ['sage', 'sage-nhd'] and not has_sageattn:
+        raise ImportError("SageAttention is not installed. Falling back to 'flash' mode.")
+        mode = 'flash'
+    
+    if mode == 'sage':
+        actual_tensor_layout = "HND"  # [B,A,S,D] format after pre_attn_layout
+    elif mode == 'sage-nhd':
+        actual_tensor_layout = "NHD"  # [B,S,A,D] format after pre_attn_layout
+    else:
+        actual_tensor_layout = None  # Not used for other modes
+    
     pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[mode]
 
-    # 应用预处理变换
-    q = pre_attn_layout(q)  # 形状根据模式变化
+    q = pre_attn_layout(q)
     k = pre_attn_layout(k)
     v = pre_attn_layout(v)
 
-    if mode == "torch":
-        # 使用PyTorch原生的scaled_dot_product_attention
+    if mode in ['sage', 'sage-nhd']:
+        if q.dtype not in [torch.float16, torch.bfloat16]:
+            raise TypeError(f"SageAttention requires torch.float16 or torch.bfloat16 inputs, got {q.dtype}")
+        
+        if attn_mask is not None:
+            import warnings
+            warnings.warn("SageAttention does not support custom attention masks. Using causal flag only.")
+        
+        if q.shape[-3] != k.shape[-3]:
+            x = sageattn(
+                q, k, v, 
+                tensor_layout=actual_tensor_layout,
+                is_causal=causal
+            )
+        else:
+            optimal_kernel = get_optimal_sage_kernel(q.device, q.dtype)
+            
+            x = optimal_kernel(
+                q, k, v,
+                tensor_layout=actual_tensor_layout,
+                is_causal=causal
+            )
+
+    elif mode == "torch":
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
         x = F.scaled_dot_product_attention(
