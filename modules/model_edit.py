@@ -27,8 +27,16 @@ class Step1XParams:
 
 class Step1XEdit(nn.Module):
     """
-    Transformer model for flow matching on sequences.
+    Transformer model for flow matching on sequences with TeaCache optimization.
     """
+
+    enable_teacache = False
+    cnt = 0
+    num_steps = 28  # Default value, will be set based on actual steps
+    rel_l1_thresh = 0.6  # Same as Flux - 0.6 for 2.0x speedup
+    accumulated_rel_l1_distance = 0
+    previous_modulated_input = None
+    previous_residual = None
 
     def __init__(self, params: Step1XParams):
         super().__init__()
@@ -122,22 +130,71 @@ class Step1XEdit(nn.Module):
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-        img = self.img_in(img)
+        # Process inputs - this happens regardless of TeaCache
+        img_processed = self.img_in(img)
         vec = self.time_in(self.timestep_embedding(timesteps, 256))
-
         vec = vec + self.vector_in(y)
-        txt = self.txt_in(txt)
-
+        txt_processed = self.txt_in(txt)
+        
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
+        
+        if self.enable_teacache:
+            # Check if we should calculate or reuse
+            modulated_inp = img_processed.clone()
+            
+            if self.cnt == 0 or self.cnt == self.num_steps-1:
+                should_calc = True
+                self.accumulated_rel_l1_distance = 0
+            else:
+                # Using the same coefficients as in Flux
+                coefficients = [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01]
+                rescale_func = np.poly1d(coefficients)
+                
+                if self.previous_modulated_input is not None:
+                    relative_diff = ((modulated_inp - self.previous_modulated_input).abs().mean() / 
+                                     self.previous_modulated_input.abs().mean()).cpu().item()
+                    self.accumulated_rel_l1_distance += rescale_func(relative_diff)
+                
+                if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
+                    should_calc = False
+                else:
+                    should_calc = True
+                    self.accumulated_rel_l1_distance = 0
+                    
+            self.previous_modulated_input = modulated_inp
+            self.cnt += 1
+            if self.cnt == self.num_steps:
+                self.cnt = 0
+                
+            if not should_calc and self.previous_residual is not None:
+                img_output = img_processed + self.previous_residual
+                img_output = self.final_layer(img_output, vec)
+                return img_output
+            else:
+                ori_img_processed = img_processed.clone()
+                
+                for block in self.double_blocks:
+                    img_processed, txt_processed = block(img=img_processed, txt=txt_processed, vec=vec, pe=pe)
 
-        for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+                img_combined = torch.cat((txt_processed, img_processed), 1)
+                for block in self.single_blocks:
+                    img_combined = block(img_combined, vec=vec, pe=pe)
+                
+                img_output = img_combined[:, txt_processed.shape[1]:, ...]
+                
+                self.previous_residual = img_output - ori_img_processed
+                
+                img_output = self.final_layer(img_output, vec)
+                return img_output
+        else:
+            for block in self.double_blocks:
+                img_processed, txt_processed = block(img=img_processed, txt=txt_processed, vec=vec, pe=pe)
 
-        img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
-        img = img[:, txt.shape[1] :, ...]
-
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-        return img
+            img_combined = torch.cat((txt_processed, img_processed), 1)
+            for block in self.single_blocks:
+                img_combined = block(img_combined, vec=vec, pe=pe)
+            
+            img_output = img_combined[:, txt_processed.shape[1]:, ...]
+            img_output = self.final_layer(img_output, vec)
+            return img_output
