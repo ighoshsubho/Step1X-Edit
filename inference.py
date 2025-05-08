@@ -413,15 +413,19 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed for generation')
     parser.add_argument('--num_steps', type=int, default=28, help='Number of diffusion steps')
     parser.add_argument('--cfg_guidance', type=float, default=6.0, help='CFG guidance strength')
-    parser.add_argument('--size_level', default=512, type=int)
+    parser.add_argument('--size_level', default=1024, type=int)
     parser.add_argument('--offload', action='store_true', help='Use offload for large models')
     parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights')
+    parser.add_argument('--teacache', action='store_true', help='Enable TeaCache optimization')
+    parser.add_argument('--teacache_threshold', type=float, default=0.6, 
+                        help='TeaCache threshold (0.25=1.5x, 0.4=1.8x, 0.6=2.0x, 0.8=2.25x speed)')
     args = parser.parse_args()
 
     assert os.path.exists(args.input_dir), f"Input directory {args.input_dir} does not exist."
     assert os.path.exists(args.json_path), f"JSON file {args.json_path} does not exist."
 
-    args.output_dir = args.output_dir.rstrip('/') + ('-offload' if args.offload else "") + ('-quantized' if args.quantized else "") + f"-{args.size_level}"
+    teacache_suffix = f"-teacache{args.teacache_threshold}" if args.teacache else ""
+    args.output_dir = args.output_dir.rstrip('/') + teacache_suffix + ('-offload' if args.offload else "") + ('-quantized' if args.quantized else "") + f"-{args.size_level}"
     os.makedirs(args.output_dir, exist_ok=True)
 
     image_and_prompts = json.load(open(args.json_path, 'r'))
@@ -434,6 +438,17 @@ def main():
         quantized=args.quantized,
         offload=args.offload,
     )
+
+    if args.teacache:
+        image_edit.dit.__class__.enable_teacache = True
+        image_edit.dit.__class__.cnt = 0
+        image_edit.dit.__class__.num_steps = args.num_steps
+        image_edit.dit.__class__.rel_l1_thresh = args.teacache_threshold
+        image_edit.dit.__class__.accumulated_rel_l1_distance = 0
+        image_edit.dit.__class__.previous_modulated_input = None
+        image_edit.dit.__class__.previous_residual = None
+        
+        print(f"TeaCache enabled with threshold {args.teacache_threshold}")
 
     time_list = []
 
